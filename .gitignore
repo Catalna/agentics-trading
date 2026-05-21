@@ -1,0 +1,24 @@
+# Virtual Environment
+venv/
+
+# Environment Variables & Secrets
+.env
+
+# Logs and Database
+logs/
+*.log
+*.db
+
+# Data & Models
+data/
+models/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editor Settings
+.vscode/
+.idea/
