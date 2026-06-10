@@ -33,9 +33,11 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import config
-from core.feature_engine import FeatureEngine, FEATURE_COLS
-from core.ml_engine import MLEngine, _build_labels
+from core.feature_engine import FeatureEngine
+from core.ml_engine import MLEngine
 from core.signal_engine import SignalEngine
+from core.orchestrator_engine import OrchestratorEngine
+from core.risk_manager import RiskManager
 from core.logger import setup_logger
 
 log = setup_logger("Backtester")
@@ -47,12 +49,12 @@ log = setup_logger("Backtester")
 
 def _apply_costs(pnl: float, notional: float, hold_candles: int) -> float:
     """Subtract trading costs from gross P&L."""
-    fee_open   = notional * config.BT_TAKER_FEE
-    fee_close  = notional * config.BT_TAKER_FEE
-    slippage   = notional * config.BT_SLIPPAGE
+    fee_open   = notional * getattr(config, "BT_MAKER_FEE", 0.0002)
+    fee_close  = notional * getattr(config, "BT_MAKER_FEE", 0.0002)
+    slippage   = notional * getattr(config, "BT_SLIPPAGE", 0.0)
     # Funding: every 8h = every 96 candles at 5m
     funding_periods = hold_candles / 96
-    funding  = notional * config.BT_FUNDING_FEE * funding_periods
+    funding  = notional * getattr(config, "BT_FUNDING_FEE", 0.0001) * funding_periods
     return pnl - fee_open - fee_close - slippage - funding
 
 
@@ -74,6 +76,35 @@ class Backtester:
         self._initial_balance = initial_balance
         self._fe = FeatureEngine()
         self._se = SignalEngine()
+        self._llme = OrchestratorEngine()
+        self._rm = RiskManager(initial_balance)
+
+    def _add_multi_tf_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Injects 15m trend and 1d macro features to mimic live environment."""
+        if "timestamp" not in df.columns:
+            return df
+        
+        # Temporary datetime index
+        df["dt"] = pd.to_datetime(df["timestamp"], unit='ms')
+        df = df.set_index("dt")
+        
+        # 15m Trend
+        df_15m = df.resample('15min').agg({'close': 'last'}).dropna()
+        df_15m["ema5"] = df_15m["close"].ewm(span=config.EMA_FAST, adjust=False).mean()
+        df_15m["ema20"] = df_15m["close"].ewm(span=config.EMA_SLOW, adjust=False).mean()
+        df_15m["trend_15m"] = np.where(df_15m["ema5"] > df_15m["ema20"], "BULLISH", "BEARISH")
+        
+        # 1d Macro
+        df_1d = df.resample('1D').agg({'high': 'max', 'low': 'min'}).dropna()
+        df_1d["macro_high"] = df_1d["high"].rolling(config.LOOKBACK_CANDLES_1D, min_periods=1).max()
+        df_1d["macro_low"] = df_1d["low"].rolling(config.LOOKBACK_CANDLES_1D, min_periods=1).min()
+        
+        # Forward fill to 5m
+        df["trend_15m"] = df_15m["trend_15m"].reindex(df.index, method='ffill')
+        df["macro_high"] = df_1d["macro_high"].reindex(df.index, method='ffill')
+        df["macro_low"] = df_1d["macro_low"].reindex(df.index, method='ffill')
+        
+        return df.reset_index(drop=False)
 
     # ── Walk-Forward ──────────────────────────────────────────────────────────
 
@@ -83,9 +114,16 @@ class Backtester:
         Returns list of per-window result dicts.
         """
         # Compute features once
-        df = self._fe.compute(df_raw).dropna(subset=FEATURE_COLS).copy()
-        df = df.reset_index(drop=True)
-
+        df = self._fe.compute(df_raw).copy()
+        df = self._add_multi_tf_features(df)
+        
+        # 4. Drop NaNs
+        feature_cols = self._fe.get_feature_columns(df)
+        df = df.dropna(subset=feature_cols).copy()
+        
+        # We need ML features in the final dataframe for ML training
+        log.info(f"[BT] Processed dataset shape: {df.shape}")
+        
         train_candles = config.BT_TRAIN_DAYS * 24 * 12
         test_candles  = config.BT_TEST_DAYS  * 24 * 12
         window_size   = train_candles + test_candles
@@ -127,32 +165,86 @@ class Backtester:
         return windows
 
     def _train_on_window(self, ml: MLEngine, train_df: pd.DataFrame) -> bool:
-        """Train the ML model on a training window (in-memory, no file I/O)."""
+        """Train the ML model ensemble on a training window (in-memory)."""
         from sklearn.model_selection import train_test_split
+        from sklearn.utils.class_weight import compute_sample_weight
         import xgboost as xgb
 
         try:
-            labels = _build_labels(train_df)
-            train_df = train_df.copy()
-            train_df["label"] = labels
+            # Labels are already in train_df thanks to FeatureEngine
             train_df = train_df.dropna(subset=["label"]).iloc[: -config.PREDICTION_HORIZON]
 
-            X = train_df[FEATURE_COLS].values
+            feature_cols = self._fe.get_feature_columns(train_df)
+            X = train_df[feature_cols].values
             y = train_df["label"].values.astype(int)
 
             if len(X) < 200:
                 log.warning(f"[BT] Too few training samples: {len(X)}")
                 return False
 
-            X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.15, shuffle=False)
+            sample_weights = compute_sample_weight("balanced", y)
 
-            model = xgb.XGBClassifier(
-                **{k: v for k, v in config.XGB_PARAMS.items()
-                   if k != "use_label_encoder"},
-                objective="binary:logistic",
+            X_tr, X_val, y_tr, y_val, sw_tr, _ = train_test_split(
+                X, y, sample_weights,
+                test_size=0.15, shuffle=False
             )
-            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-            ml._model = model
+
+            # MODEL 1: Conservative
+            model_1 = xgb.XGBClassifier(
+                objective='multi:softprob',
+                num_class=3,
+                max_depth=4,
+                learning_rate=0.05,
+                n_estimators=300,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                reg_alpha=1.0,
+                reg_lambda=2.0,
+                eval_metric="mlogloss",
+                random_state=42,
+                tree_method="hist",
+                device="cuda"
+            )
+            
+            # MODEL 2: Balanced
+            model_2 = xgb.XGBClassifier(
+                objective='multi:softprob',
+                num_class=3,
+                max_depth=6,
+                learning_rate=0.1,
+                n_estimators=200,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.5,
+                reg_lambda=1.0,
+                eval_metric="mlogloss",
+                random_state=123,
+                tree_method="hist",
+                device="cuda"
+            )
+            
+            # MODEL 3: Aggressive
+            model_3 = xgb.XGBClassifier(
+                objective='multi:softprob',
+                num_class=3,
+                max_depth=8,
+                learning_rate=0.15,
+                n_estimators=150,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                reg_alpha=0.1,
+                reg_lambda=0.5,
+                eval_metric="mlogloss",
+                random_state=456,
+                tree_method="hist",
+                device="cuda"
+            )
+
+            model_1.fit(X_tr, y_tr, sample_weight=sw_tr, eval_set=[(X_val, y_val)], verbose=False)
+            model_2.fit(X_tr, y_tr, sample_weight=sw_tr, eval_set=[(X_val, y_val)], verbose=False)
+            model_3.fit(X_tr, y_tr, sample_weight=sw_tr, eval_set=[(X_val, y_val)], verbose=False)
+
+            ml.models = [model_1, model_2, model_3]
             return True
         except Exception as exc:
             log.error(f"[BT] Train failed: {exc}")
@@ -163,6 +255,7 @@ class Backtester:
     def _simulate(self, ml: MLEngine, df: pd.DataFrame) -> Dict:
         """Simulate trading on test window. Returns metrics dict."""
         balance      = self._initial_balance
+        self._rm.update_balance(balance)
         peak_balance = balance
         state        = "NONE"         # NONE | LONG | SHORT
         entry_price  = 0.0
@@ -180,7 +273,8 @@ class Backtester:
         neutral_llm       = {"market_state": "Backtest", "confidence_adjustment": 0.0}
 
         for i, row in df.iterrows():
-            feats = {col: row[col] for col in FEATURE_COLS}
+            feature_cols = self._fe.get_feature_columns(df)
+            feats = {col: row[col] for col in feature_cols}
             feats.update({
                 "close":    row["close"],
                 "high":     row["high"],
@@ -199,7 +293,9 @@ class Backtester:
                 "macd_slope": row.get("macd_slope", 0.0),
                 "regime":   row["regime"],
                 "trend_dir":row["trend_dir"],
-                "trend_15m":"NEUTRAL",
+                "trend_15m":row.get("trend_15m", "NEUTRAL"),
+                "macro_high":row.get("macro_high", row["high"]),
+                "macro_low":row.get("macro_low", row["low"]),
             })
 
             close = row["close"]
@@ -217,13 +313,16 @@ class Backtester:
                 if hit_sl or hit_tp:
                     exit_price = tp_price if hit_tp else sl_price
                     candles_held = int(i) - entry_idx
-                    notional = entry_price * (self._position_qty(balance, atr, entry_price))
+                    # Gunakan RiskManager yang sudah menghitung sizing, kita simpan nilainya ke self._last_qty saat open
+                    qty = getattr(self, "_last_qty", 0.0)
+                    notional = entry_price * qty
                     gross_pnl = (
                         (exit_price - entry_price) if state == "LONG" else (entry_price - exit_price)
-                    ) * self._position_qty(balance, atr, entry_price) * config.LEVERAGE
+                    ) * qty
                     net_pnl = _apply_costs(gross_pnl, notional, candles_held)
 
                     balance  = max(0.0, balance + net_pnl)
+                    self._rm.update_balance(balance)
                     peak_balance = max(peak_balance, balance)
 
                     trades.append({
@@ -250,38 +349,57 @@ class Backtester:
 
             # ── Generate signal ─────────────────────────────────────────────
             if state == "NONE":
-                feat_row = self._fe.build_ml_feature_row(feats)
+                feat_row = pd.DataFrame([{col: feats.get(col, 0.0) for col in feature_cols}])
                 ml_probs = ml.predict(feat_row)
                 signal   = self._se.evaluate(ml_probs, feats, neutral_sentiment, neutral_llm)
 
                 if signal["action"] in ("LONG", "SHORT") and balance > 0:
-                    side       = signal["action"]
-                    sl_off     = atr * config.SL_ATR_MULT
-                    tp_off     = atr * config.TP_ATR_MULT
-                    if side == "LONG":
-                        entry_price = close * (1 + config.BT_SLIPPAGE)
-                        sl_price    = round(entry_price - sl_off, 2)
-                        tp_price    = round(entry_price + tp_off, 2)
-                    else:
-                        entry_price = close * (1 - config.BT_SLIPPAGE)
-                        sl_price    = round(entry_price + sl_off, 2)
-                        tp_price    = round(entry_price - tp_off, 2)
-                    current_sl  = sl_price
-                    entry_idx   = int(i)
-                    state       = side
+                    # LLM confirmation — skipped in backtest by default for speed
+                    skip_llm = getattr(config, "BACKTEST_SKIP_LLM", True)
+                    if config.MULTI_LLM_ENABLED and not skip_llm:
+                        log.info(f"[BT] Setup found! Querying LLM at {df.loc[i, 'dt']}...")
+                        llm_result = self._llme.analyze(feats, ml_probs, neutral_sentiment, state)
+                        signal = self._se.evaluate(ml_probs, feats, neutral_sentiment, llm_result)
+
+                    if signal["action"] in ("LONG", "SHORT"):
+                        # Get exact position size from RiskManager
+                        qty = self._rm.get_position_size(balance, signal["confidence"], atr, close)
+                        
+                        if qty > 0:
+                            side       = signal["action"]
+                            self._last_qty = qty
+                        else:
+                            side       = "" # Ditolak oleh guardrail RiskManager
+                    
+                    if side:
+                        sl_off     = atr * config.SL_ATR_MULT
+                        tp_off     = atr * config.TP_ATR_MULT
+                        if side == "LONG":
+                            entry_price = close * (1 + config.BT_SLIPPAGE)
+                            sl_price    = round(entry_price - sl_off, 2)
+                            tp_price    = round(entry_price + tp_off, 2)
+                        else:
+                            entry_price = close * (1 - config.BT_SLIPPAGE)
+                            sl_price    = round(entry_price + sl_off, 2)
+                            tp_price    = round(entry_price - tp_off, 2)
+                        current_sl  = sl_price
+                        entry_idx   = int(i)
+                        state       = side
 
             equity_curve.append(balance)
 
         # Force-close any open position at end of window
         if state != "NONE" and len(df) > 0:
             final_price = df.iloc[-1]["close"]
-            candles_held = len(df) - entry_idx
-            notional = entry_price * self._position_qty(balance, df.iloc[-1]["atr"], entry_price)
+            candles_held = int(df.index[-1]) - entry_idx
+            qty = getattr(self, "_last_qty", 0.0)
+            notional = entry_price * qty
             gross_pnl = (
                 (final_price - entry_price) if state == "LONG" else (entry_price - final_price)
-            ) * self._position_qty(balance, df.iloc[-1]["atr"], entry_price) * config.LEVERAGE
+            ) * qty
             net_pnl = _apply_costs(gross_pnl, notional, candles_held)
             balance = max(0.0, balance + net_pnl)
+            self._rm.update_balance(balance)
             trades.append({
                 "side": state, "entry": entry_price, "exit": final_price,
                 "pnl": net_pnl, "candles": candles_held, "reason": "EOW",
@@ -293,18 +411,15 @@ class Backtester:
 
     @staticmethod
     def _position_qty(balance: float, atr: float, price: float) -> float:
-        """Replicate risk manager sizing for backtest (mid-tier 1% risk)."""
-        risk   = balance * config.RISK_TIER_MID
-        sl_usd = atr * config.SL_ATR_MULT
-        qty    = risk / sl_usd if sl_usd > 0 else 0.001
-        return max(qty, config.MIN_POSITION_NOTIONAL / price)
+        # NOTE: Deprecated, now handled by RiskManager instance in _simulate.
+        pass
 
     @staticmethod
     def _compute_metrics(trades: List[Dict], equity: List[float], final_balance: float) -> Dict:
         if not trades:
             return {
                 "total_trades": 0, "win_rate": 0, "profit_factor": 0,
-                "sharpe": 0, "max_drawdown_pct": 0,
+                "sharpe_ratio": 0, "max_drawdown_pct": 0,
                 "total_pnl": 0, "avg_duration_min": 0, "final_balance": final_balance,
             }
 
@@ -400,20 +515,30 @@ class Backtester:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import time as _time
+    import pandas as pd
+
+    SYNTHETIC_PATH = "data/synthetic_ohlcv.csv"
 
     log.info(f"[BT] Starting {config.BT_TOTAL_DAYS}-day walk-forward backtest for {config.SYMBOL}…")
-    log.info("[BT] Fetching historical data…")
 
-    from core.market_data_engine import MarketDataEngine
-    mde = MarketDataEngine()
-    df_raw = mde.fetch_training_data(days=config.BT_TOTAL_DAYS)
+    # Load data: synthetic CSV first, live Binance as fallback
+    df_raw = pd.DataFrame()
+    if os.path.exists(SYNTHETIC_PATH):
+        log.info(f"[BT] Loading synthetic dataset → {SYNTHETIC_PATH}")
+        df_raw = pd.read_csv(SYNTHETIC_PATH)
+        log.info(f"[BT] {len(df_raw):,} candles loaded from synthetic data.")
+    else:
+        log.info("[BT] No synthetic data found — fetching from Binance…")
+        from core.market_data_engine import MarketDataEngine
+        mde = MarketDataEngine()
+        df_raw = mde.fetch_training_data(days=config.BT_TOTAL_DAYS)
 
     if df_raw.empty:
-        log.error("[BT] No data fetched. Exiting.")
+        log.error("[BT] No data available. Exiting.")
         sys.exit(1)
 
-    log.info(f"[BT] {len(df_raw)} candles fetched. Running walk-forward…")
+    log.info(f"[BT] Running walk-forward simulation on {len(df_raw):,} candles…")
     bt      = Backtester(initial_balance=1000.0)
     results = bt.run_walk_forward(df_raw)
     bt.print_summary(results)
+

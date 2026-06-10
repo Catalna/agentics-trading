@@ -6,12 +6,17 @@ venv/
 
 # Logs and Database
 logs/
+backtest/logs/
 *.log
 *.db
 
 # Data & Models
 data/
 models/
+*.pt
+*.pth
+*.whl
+sentence-transformers/
 
 # Python Cache
 __pycache__/
@@ -22,3 +27,7 @@ __pycache__/
 # Editor Settings
 .vscode/
 .idea/
+
+# OS Files
+.DS_Store
+Thumbs.db

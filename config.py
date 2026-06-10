@@ -7,7 +7,7 @@ import os
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ─── Exchange ──────────────────────────────────────────────────────────────────
 EXCHANGE_ID          = "binanceusdm"
@@ -15,32 +15,42 @@ TESTNET              = True
 API_KEY              = os.getenv("BINANCE_API_KEY", "")
 API_SECRET           = os.getenv("BINANCE_API_SECRET", "")
 SYMBOL = "BTC/USDT:USDT"
-LEVERAGE             = 50
-ORDER_TYPE           = "market"         # "market" for instant fills (open position), "limit" for no-slippage orderbook entries
+LEVERAGE             = 100            # Extreme Scalping: kecil modal, besar notional
+ORDER_TYPE           = "limit"        # Limit Order = Maker fee (0.02%), no slippage
 
 # ─── Timeframes ────────────────────────────────────────────────────────────────
+TF_MICRO             = "1m"           # For micro-trend and orderbook veto
 TF_EXEC              = "5m"
 TF_TREND             = "15m"
+TF_SWING_1           = "1h"
+TF_SWING_2           = "4h"
+TF_MACRO             = "1d"
 PREDICTION_HORIZON   = 4               # Candles ahead for label engineering
 
 # ─── Data ──────────────────────────────────────────────────────────────────────
+LOOKBACK_CANDLES_1M  = 50
 LOOKBACK_CANDLES_5M  = 2000
 LOOKBACK_CANDLES_15M = 1500
+LOOKBACK_CANDLES_1H  = 500
+LOOKBACK_CANDLES_4H  = 200
+LOOKBACK_CANDLES_1D  = 100
 TRAINING_DAYS        = 90              # Increased: more data → better model
 CANDLE_LIMIT         = 1000
 
-# ─── ML / XGBoost ──────────────────────────────────────────────────────────────
 XGB_PARAMS = {
-    "n_estimators":      400,          # More trees for richer features
-    "max_depth":         5,
-    "learning_rate":     0.02,
-    "subsample":         0.75,
-    "colsample_bytree":  0.75,
-    "gamma":             0.05,
-    "min_child_weight":  3,
+    "n_estimators":      600,          # More trees for richer features
+    "max_depth":         6,            # Slightly deeper — more complex patterns
+    "learning_rate":     0.015,        # Slower learn rate = better generalisation
+    "subsample":         0.80,
+    "colsample_bytree":  0.80,
+    "gamma":             0.02,         # Lower gamma = more splits = more precision
+    "min_child_weight":  2,            # Lower = catches rare setups
     "eval_metric":       "logloss",
     "random_state":      42,
     "n_jobs":            -1,
+    "scale_pos_weight":  1,            # Re-balanced per class via sample_weight
+    "tree_method":       "hist",       # GPU acceleration
+    "device":            "cuda",       # Use RTX 5050
 }
 MODEL_PATH           = "models/xgb_model.json"
 RETRAIN_INTERVAL_H   = 24
@@ -53,36 +63,39 @@ LABEL_SHORT          = 1
 # ─── ATR ───────────────────────────────────────────────────────────────────────
 ATR_PERIOD           = 14
 
-# Aggressive TP system (100% target)
-TP_ATR_MULT          = 0.50           # TP: close 100% of position (HFT scalp)
-SL_ATR_MULT          = 0.20           # Dynamic SL (HFT scalp)
+# ATR Targets (dipakai saat USE_PERCENTAGE_TGT = False)
+TP_ATR_MULT          = 2.00           # TP: 2× ATR
+SL_ATR_MULT          = 1.00           # SL: 1.5× ATR
+TRAILING_ATR_MULT    = 0.50           # Trailing stop distance
 
-# Fixed Percentage-Based Targets (Alternative to ATR for ultra-fast scalping)
-USE_PERCENTAGE_TGT   = True           # Set to True for fixed percentage-based scalp targets
-TP_PCT               = 0.0012         # 0.12% price change (approx 6.0% ROI at 50x leverage)
-SL_PCT               = 0.0005         # 0.05% price change (approx 2.5% ROI at 50x leverage)
+# Fixed Percentage-Based Targets — AKTIF untuk scalping 5-menit
+USE_PERCENTAGE_TGT   = True           # Pakai fixed % supaya AI cepat TP/SL di scalping
+TP_PCT               = 0.0025         # 0.25% = profit cukup untuk cover maker fee 2 arah (0.04% total)
+SL_PCT               = 0.0015         # 0.15% = SL dinaikkan sedikit agar tidak mudah tersentuh
 
 # ─── Indicators ────────────────────────────────────────────────────────────────
 EMA_FAST             = 5
+EMA_SCALP            = 13
 EMA_SLOW             = 20
 RSI_PERIOD           = 14
+LINREG_PERIOD        = 20
 MACD_FAST            = 12
 MACD_SLOW            = 26
 MACD_SIGNAL          = 9
 ADX_PERIOD           = 14
-ADX_TREND_THRESHOLD  = 20             # Lowered from 25 to catch more trends
+ADX_TREND_THRESHOLD  = 18             # Even lower — catch trends earlier
 BB_PERIOD            = 20             # Bollinger Bands
 BB_STD               = 2.0
-VOLUME_RATIO_MIN     = 1.2            # Min volume ratio for entry confirmation
+VOLUME_RATIO_MIN     = 1.1            # Lowered for faster entry in scalp mode
 
 # ─── Signal Architecture ───────────────────────────────────────────────────────
 # Always produce LONG_SCORE vs SHORT_SCORE; pick the higher one.
 # HOLD is NOT a signal — it's a position management state.
 # Weights sum to 1.0.  Swarm replaces 10% from ML when enabled.
-WEIGHT_ML            = 0.60           # ML engine (reduced by 10% to make room for swarm)
-WEIGHT_TECH          = 0.10           # Technical indicators
-WEIGHT_SENTIMENT     = 0.10           # Sentiment engine
-WEIGHT_LLM           = 0.10           # Multi-LLM consensus
+WEIGHT_ML            = 0.55           # ML engine — primary signal
+WEIGHT_TECH          = 0.15           # Technical indicators — boosted for precision
+WEIGHT_SENTIMENT     = 0.08           # Sentiment engine
+WEIGHT_LLM           = 0.12           # Multi-LLM consensus — boosted
 WEIGHT_SWARM         = 0.10           # Swarm agent consensus (14 agents, 4 layers)
 
 # ─── Swarm Agent System ────────────────────────────────────────────────────────
@@ -90,9 +103,9 @@ SWARM_ENABLED        = True            # Enable swarm agent layer
 SWARM_CONSENSUS_THRESHOLD = 0.55      # Min consensus confidence to count as signal
 
 # ─── Confidence Thresholds ─────────────────────────────────────────────────────
-CONF_NO_POSITION     = 0.52           # Min score to enter when flat (reduced to 0.52 for ultra-aggressive MT4-EA style)
-CONF_EXISTING        = 0.52           # Min opposite score to reverse (set to same as entry for instant reversal)
-CONF_REVERSAL        = 0.52           # Min score to immediately reverse (set to same as entry for instant reversal)
+CONF_NO_POSITION     = 0.52           # Agresif: entry mudah untuk scalping cepat
+CONF_EXISTING        = 0.52           # Sama dengan entry — reversal instan
+CONF_REVERSAL        = 0.52           # Bypass age filter jika sinyal kuat
 
 # ─── Technical Entry Conditions ────────────────────────────────────────────────
 # LONG bias: EMA5>EMA20, RSI 50–70, MACD bullish, ADX>20, volume>1.2×
@@ -109,24 +122,41 @@ RISK_TIER_HIGH       = 0.015          # 1.5%
 MAX_DAILY_LOSS_PCT   = 0.02
 MAX_DRAWDOWN_PCT     = 0.10
 MIN_POSITION_NOTIONAL = 10.0
-MAX_EFFECTIVE_LEVERAGE = 2.0          # Max single-trade notional size as a multiple of account balance (safe for new/demo accounts)
-MARGIN_ALLOCATION_PCT = 0.05          # Margin allocated per trade (e.g. 0.05 = 5% of balance used as margin)
+MAX_EFFECTIVE_LEVERAGE = 3.0          # Max single-trade notional size as a multiple of account balance
+MARGIN_ALLOCATION_PCT = 0.05          # Margin allocated per trade (5% of balance used as margin)
+
+# ─── Fee Context (otomatis disesuaikan engine) ────────────────────────────────
+# Gunakan LIVE_FEE_PCT saat trading nyata (Limit Order = Maker fee)
+# Backtest simulator sudah punya BT_MAKER_FEE sendiri
+LIVE_MAKER_FEE_PCT   = 0.0002         # 0.02% Binance Maker (Limit Order)
+LIVE_TAKER_FEE_PCT   = 0.0004         # 0.04% Binance Taker (Market Order - fallback)
+
+# ─── Kelly Criterion (Rolling Window Position Sizing) ───────────────────────────
+KELLY_WINDOW         = 7             # Jumlah trade terakhir untuk kalkulasi Kelly (rolling window)
+KELLY_MAX_FRACTION   = 0.50          # Half-Kelly cap — max 50% dari full Kelly untuk safety
+KELLY_MIN_MARGIN_PCT = 0.01          # Min margin 1% saat kondisi sangat buruk
+KELLY_MAX_MARGIN_PCT = 0.10          # Max margin 10% saat kondisi sangat bagus
+KELLY_MIN_TRADES     = 3             # Min trade di window sebelum Kelly aktif (pakai default jika belum)
+
+# ─── Anti-Whipsaw Reversal Filter ──────────────────────────────────────────────
+REVERSAL_MIN_AGE_MIN = 5             # Dinaikkan jadi 5 menit untuk mencegah whipsaw bolak-balik (hemat fee)
+REVERSAL_BYPASS_CONF = 0.85          # Dinaikkan jadi 0.85 agar bypass hanya terjadi saat sinyal sangat kuat
 
 # ─── LLM ───────────────────────────────────────────────────────────────────────
 OLLAMA_URL           = "http://localhost:11434"
-OLLAMA_MODEL         = "qwen2.5:7b"          # Primary / fallback model
-LLM_TIMEOUT_S        = 15
-LLM_MAX_INFLUENCE    = 0.05
+OLLAMA_MODEL         = "llama3.1:latest"     # Primary / fallback model
+LLM_TIMEOUT_S        = 120     # Timeout per LLM call (seconds) — increased for local GPU
+LLM_MAX_INFLUENCE    = 0.06                  # Slight boost to LLM influence
 
-# Multi-LLM Voting — all installed Ollama models with contribution weights
+# Multi-LLM Voting — 3 installed Ollama models with contribution weights
 # Weights must sum to 1.0.  Larger/smarter models get higher weight.
 OLLAMA_MODELS = {
-    "qwen2.5:7b":      0.40,   # Primary analyst — highest accuracy
-    "llama3.1:latest": 0.35,   # Secondary analyst — strong reasoning
-    "qwen2.5:3b":      0.15,   # Fast lightweight voter
-    "llama3.2:3b":     0.10,   # Tie-breaker / speed voter
+    "deepseek-r1:7b":  0.50,   # Chief Supervisor — final decision
+    "qwen2.5:7b":      0.30,   # Technical Manager
+    "mistral:7b":      0.20,   # Sentiment Manager
 }
-MULTI_LLM_ENABLED   = True    # Set False to revert to single-model mode
+MULTI_LLM_ENABLED    = True    # Set False to revert to single-model mode
+BACKTEST_SKIP_LLM    = True    # Skip LLM calls in backtest for speed (use neutral)
 
 # ─── Sentiment ─────────────────────────────────────────────────────────────────
 # 7 pure-RSS/API sources — no credentials required
@@ -193,12 +223,13 @@ SENTIMENT_CACHE_PATH  = "data/sentiment_cache.json"
 
 # ─── Backtest ──────────────────────────────────────────────────────────────────
 BT_TAKER_FEE         = 0.0004
-BT_SLIPPAGE          = 0.0005
+BT_MAKER_FEE         = 0.0002
+BT_SLIPPAGE          = 0.0
 BT_FUNDING_FEE       = 0.0001
 BT_FUNDING_INTERVAL  = 8 * 60 * 60
-BT_TRAIN_DAYS        = 30
+BT_TRAIN_DAYS        = 14
 BT_TEST_DAYS         = 7
-BT_TOTAL_DAYS        = 90
+BT_TOTAL_DAYS        = 30
 
 # ─── Paths ─────────────────────────────────────────────────────────────────────
 LOG_DIR              = "logs"
@@ -208,5 +239,24 @@ DB_PATH              = "logs/trading.db"
 LOG_FILE             = "logs/ea.log"
 
 # ─── Loop Timing ───────────────────────────────────────────────────────────────
-MAIN_LOOP_SLEEP_S    = 3
-COOLDOWN_AFTER_TRADE = 0              # Zero cooldown — immediate re-entry for HFT mode
+MAIN_LOOP_SLEEP_S    = 2              # Faster loop — 2s instead of 3s
+COOLDOWN_AFTER_TRADE = 0             # Zero cooldown — immediate re-entry for HFT mode
+
+# ─── Exchange & Execution (Binance) ────────────────────────────────────────────
+BINANCE_API_KEY      = os.getenv("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY   = os.getenv("BINANCE_API_SECRET", "")
+USE_TESTNET          = True          # Set True for paper trading on Binance Testnet
+DEFAULT_LEVERAGE     = 100           # MAX 100x — Binance USDT-M Futures
+
+# ─── Risk Management & SL/TP for 100x ─────────────────────────────────────────
+# At 100x leverage, liquidation occurs at ~1% from entry.
+# SL must be < liquidation to avoid getting wiped.
+# Rule: SL = 0.3% | TP = 0.6% | RR = 2:1
+RISK_PER_TRADE_PCT   = 0.01          # Risk 1% of account balance per trade
+DEFAULT_SL_PCT       = 0.003         # 0.3% SL — safe buffer before 100x liquidation
+DEFAULT_TP_PCT       = 0.006         # 0.6% TP — 2:1 RR ratio
+MAX_OPEN_POSITIONS   = 1
+MIN_CONFIDENCE       = 0.65          # SNIPER + EA MODE: 70% confidence for HTF-aligned momentum
+
+CLAUDE_API_KEY       = ""
+USE_CLAUDE_VALIDATION = False        # If True, Claude validates final DeepSeek decision

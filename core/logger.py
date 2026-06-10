@@ -357,3 +357,42 @@ class DBLogger:
                 "SELECT * FROM trades WHERE status='CLOSED' ORDER BY exit_ts DESC LIMIT ?", (n,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_recent_performance(self, n: int = 7) -> dict:
+        """
+        Ambil statistik performa dari N trade terakhir untuk Rolling Kelly Criterion.
+
+        Returns:
+            {
+                "n_trades":   int,   # jumlah trade yang ditemukan
+                "win_rate":   float, # persentase trade profit (0.0 - 1.0)
+                "avg_win":    float, # rata-rata PnL saat profit (USDT)
+                "avg_loss":   float, # rata-rata PnL saat rugi (absolute, USDT)
+                "win_loss_r": float, # ratio avg_win / avg_loss
+            }
+        """
+        trades = self.get_recent_trades(n=n)
+        if not trades:
+            return {
+                "n_trades":   0,
+                "win_rate":   0.5,   # Default netral jika belum ada data
+                "avg_win":    1.0,
+                "avg_loss":   1.0,
+                "win_loss_r": 1.0,
+            }
+
+        wins  = [t["pnl_usdt"] for t in trades if (t.get("pnl_usdt") or 0) > 0]
+        losses = [abs(t["pnl_usdt"]) for t in trades if (t.get("pnl_usdt") or 0) <= 0]
+
+        win_rate  = len(wins) / len(trades)
+        avg_win   = sum(wins)   / len(wins)   if wins   else 0.0
+        avg_loss  = sum(losses) / len(losses) if losses else 1.0  # hindari div-by-zero
+        win_loss_r = avg_win / avg_loss if avg_loss > 0 else 1.0
+
+        return {
+            "n_trades":   len(trades),
+            "win_rate":   round(win_rate,   4),
+            "avg_win":    round(avg_win,    4),
+            "avg_loss":   round(avg_loss,   4),
+            "win_loss_r": round(win_loss_r, 4),
+        }
